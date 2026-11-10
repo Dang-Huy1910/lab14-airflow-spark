@@ -1,0 +1,187 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: airflow-spark-lab14:2.7.3
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    - AIRFLOW__CORE__FERNET_KEY=fb04vP1w98B6qJ7s2o7bF6R_5P9w9J_lZ5P2Y0r6w8E=
+    - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false
+    - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    - AIRFLOW_CONN_POSTGRES_DEFAULT=postgresql://airflow:airflow@postgres:5432/airflow
+    - SPARK_HOME=/opt/spark
+    - JAVA_HOME=/opt/java
+    - PYTHONPATH=/opt/airflow:/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./jars:/opt/airflow/jars
+    - ./data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - airflow-spark-net
+
+services:
+  # ============================================================================
+  # 1. PostgreSQL Database (Airflow metadata + Target Data Warehouse)
+  # ============================================================================
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./sql/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - airflow-spark-net
+    restart: always
+
+  # ============================================================================
+  # 2. Airflow Initialization (Database migrations + Admin user creation)
+  # ============================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "=== Waiting for PostgreSQL to be ready ==="
+        airflow db migrate
+        echo "=== Creating Admin User ==="
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin || true
+        echo "=== Setting up Connections ==="
+        airflow connections add 'spark_default' \
+          --conn-type 'spark' \
+          --conn-host 'spark://spark-master' \
+          --conn-port 7077 || true
+        airflow connections add 'postgres_default' \
+          --conn-type 'postgres' \
+          --conn-host 'postgres' \
+          --conn-login 'airflow' \
+          --conn-password 'airflow' \
+          --conn-schema 'airflow' \
+          --conn-port 5432 || true
+        echo "=== Airflow Init Finished Successfully ==="
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ============================================================================
+  # 3. Airflow Webserver (UI at http://localhost:8080)
+  # ============================================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  # ============================================================================
+  # 4. Airflow Scheduler (Executes DAG tasks & submits Spark jobs)
+  # ============================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: airflow scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    restart: always
+
+  # ============================================================================
+  # 5. Apache Spark Cluster - Master (Bitnami Spark 3.4.1)
+  # ============================================================================
+  spark-master:
+    image: bitnamilegacy/spark:3.4.1
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "7077:7077" # Spark RPC
+      - "8081:8080" # Spark Master Web UI mapped to 8081
+    volumes:
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./data:/opt/airflow/data
+      - ./jars:/opt/airflow/jars
+      - ./jars/postgresql-42.6.0.jar:/opt/bitnami/spark/jars/postgresql-42.6.0.jar
+    networks:
+      - airflow-spark-net
+    restart: always
+
+  # ============================================================================
+  # 6. Apache Spark Cluster - Worker (Bitnami Spark 3.4.1)
+  # ============================================================================
+  spark-worker:
+    image: bitnamilegacy/spark:3.4.1
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8082:8081" # Spark Worker Web UI
+    volumes:
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./data:/opt/airflow/data
+      - ./jars:/opt/airflow/jars
+      - ./jars/postgresql-42.6.0.jar:/opt/bitnami/spark/jars/postgresql-42.6.0.jar
+    depends_on:
+      - spark-master
+    networks:
+      - airflow-spark-net
+    restart: always
+
+networks:
+  airflow-spark-net:
+    driver: bridge
+
+volumes:
+  postgres-db-volume:

@@ -1,0 +1,39 @@
+{
+  "fetched_at": "2026-11-10T08:49:57.092806",
+  "races": [
+    "Dragonborn",
+    "Dwarf",
+    "Elf",
+    "Gnome",
+    "Half-Elf",
+    "Half-Orc",
+    "Halfling",
+    "Human",
+    "Tiefling"
+  ],
+  "classes": [
+    "Barbarian",
+    "Bard",
+    "Cleric",
+    "Druid",
+    "Fighter",
+    "Monk",
+    "Paladin",
+    "Ranger",
+    "Rogue",
+    "Sorcerer",
+    "Warlock",
+    "Wizard"
+  ],
+  "alignments": [
+    "Lawful Good",
+    "Neutral Good",
+    "Chaotic Good",
+    "Lawful Neutral",
+    "True Neutral",
+    "Chaotic Neutral",
+    "Lawful Evil",
+    "Neutral Evil",
+    "Chaotic Evil"
+  ]
+}
